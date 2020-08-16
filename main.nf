@@ -452,6 +452,8 @@ workflow wf_mpileup{
         MergeMpileup(
             Mpileup.out.groupTuple(by:[0, 1]) 
         )
+    emit:
+        pileups = MergeMpileup.out
 } // end of wf_mpileup
 
 workflow wf_recal_bams{
@@ -1338,7 +1340,7 @@ workflow{
         ch_fasta,
             ch_fasta_fai
     )
-
+    
     wf_recal_bams(
             wf_mark_duplicates.out.dm_bams, // recalibrated bams
             ch_bed_intervals,
@@ -1474,6 +1476,13 @@ workflow{
         ch_dbsnp,
         ch_dbsnp_index,
         ch_target_bed
+    )
+
+    // michael's allele balance QC
+    // wf_deepvariant.out.vcf
+    allele_balance_analyze(
+            wf_mpileup.out.pileups,
+            ConcatVCF.out.concatenated_vcf_with_index
     )
 
     wf_genotype_gvcf(
@@ -4366,6 +4375,24 @@ process MultiQC {
     """
 }
 
+/******************************************************************************************/
+                                /* Allele Balance QC */
+/******************************************************************************************/
+
+process allele_balance_analyze{
+    publishDir "${params.outdir}/AlleleBalance/${idSample}",
+    mode: params.publish_dir_mode
+
+    input:
+    tuple idPatient, idSample, file(mpileup)
+    tuple variantCaller, idPatient, idSample, file(vcf), file(tbi) 
+    output:
+    file 'output.tsv' 
+
+    """
+    analyze_sample.py --vcf $vcf --pileup $mpileup  --type analyze --db /scratch/Shares/layer/workspace/michael_sandbox/exome.db
+    """
+}
 
 /******************************************************************************************/
                                 /* Helper functions */
@@ -4864,10 +4891,6 @@ def getVCFsToAnnotate(results_dir, annotate_tools, tsv){
         Channel.fromPath("${results_dir}/VariantCalling/*/HaplotypeCaller/*.vcf.gz")
             .flatten().map{vcf -> ['HaplotypeCaller', vcf.minus(vcf.fileName)[-2].toString(), vcf]},
         Channel.fromPath("${results_dir}/VariantCalling/*/Manta/*[!candidate]SV.vcf.gz")
-            .flatten().map{vcf -> ['Manta', vcf.minus(vcf.fileName)[-2].toString(), vcf]},
-        Channel.fromPath("${results_dir}/VariantCalling/*/Mutect2/*.vcf.gz")
-            .flatten().map{vcf -> ['Mutect2', vcf.minus(vcf.fileName)[-2].toString(), vcf]},
-        Channel.fromPath("${results_dir}/VariantCalling/*/Strelka/*{somatic,variant}*.vcf.gz")
             .flatten().map{vcf -> ['Strelka', vcf.minus(vcf.fileName)[-2].toString(), vcf]},
         Channel.fromPath("${results_dir}/VariantCalling/*/TIDDIT/*.vcf.gz")
             .flatten().map{vcf -> ['TIDDIT', vcf.minus(vcf.fileName)[-2].toString(), vcf]}
