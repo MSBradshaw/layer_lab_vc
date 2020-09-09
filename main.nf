@@ -4390,7 +4390,7 @@ process allele_balance_analyze{
     file 'output.tsv' 
 
     """
-    analyze_sample.py --vcf $vcf --pileup $mpileup  --type analyze --db /scratch/Shares/layer/workspace/michael_sandbox/exome.db
+    analyze_sample.py --vcf $vcf --pileup $mpileup  --type analyze --name $idSample --db /scratch/Shares/layer/workspace/michael_sandbox/exome.db
     """
 }
 

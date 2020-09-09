@@ -7,3 +7,6 @@ results/
 Makefile
 .nextflow/
 .nextflow.log*
+single.tsv
+bams.tsv
+delete*

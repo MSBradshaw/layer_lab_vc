@@ -6,7 +6,7 @@ import numpy as np
 import argparse
 import glob
 import gzip
-
+from scipy import stats
 
 class DatabaseAccess:
     def __init__(self, db_path):
@@ -16,10 +16,12 @@ class DatabaseAccess:
         id INTEGER PRIMARY KEY,
         position INTEGER,
         genotype TEXT,
+        numerical_genotype TEXT,
         alleles TEXT,
         allele_counts TEXT,
         allele_balances TEXT,
         first_alleles TEXT,
+        samples TEXT,
         reference_allele TEXT
         );
         """
@@ -45,8 +47,16 @@ class DatabaseAccess:
             chromosome	position	genotype	diff	allele_balance	geno_string	number_of_alleles
         :return: None
         """
-        df = pd.read_csv(path_to_tsv, sep='\t', skiprows=1)
-        get_template = """SELECT allele_balances, allele_counts, alleles, first_alleles 
+        # get the first 2 lines, the second contains the sample name
+        sample = None
+        with open(path_to_tsv, 'r') as file:
+            for i, line in enumerate(file):
+                if i == 1:
+                    sample = line.split('\t')[1].strip()
+                    break
+
+        df = pd.read_csv(path_to_tsv, sep='\t', skiprows=2)
+        get_template = """SELECT allele_balances, allele_counts, alleles, first_alleles, samples 
         FROM chromosome_{chrom} WHERE position = {pos} AND genotype = "{genotype}"
         """
         update_template = """ UPDATE chromosome_{chrom}
@@ -54,18 +64,23 @@ class DatabaseAccess:
         allele_balances = "{ab}",
         allele_counts = "{ac}",
         alleles = "{alleles}",
-        first_alleles = "{ma}"
+        first_alleles = "{ma}",
+        samples = "{samps}"
         WHERE
         position = {pos}
         AND
         genotype = "{genotype}"
         """
         insert_template = """INSERT INTO chromosome_{chrom} 
-        (position, allele_balances, allele_counts, genotype, first_alleles, alleles)
-        VALUES ({pos},"{ab}","{ac}","{genotype}","{ma}","{alleles}")
+        (position, allele_balances, allele_counts, genotype, first_alleles, alleles, samples, numerical_genotype)
+        VALUES ({pos},"{ab}","{ac}","{genotype}","{ma}","{alleles}","{samps}","{ng}")
         """
         # for each chromosome
         for c in set(df['chromosome']):
+            if str(c) != '1':
+                continue
+            else:
+                print('Chromosome: ' + str(c))
             sub = df[df['chromosome'] == c]
             sub.index = sub['position']
             # for each position
@@ -76,6 +91,7 @@ class DatabaseAccess:
                 allele_count = sub.loc[p]['allele_counts']
                 genotype = sub.loc[p]['genotype']
                 alleles = sub.loc[p]['alleles']
+                numerical_genotype = sub.loc[p]['numerical_genotype']
                 curs.execute(get_template.format(chrom=c, pos=p, genotype=genotype))
                 res = curs.fetchall()
                 if len(res) == 0:
@@ -83,7 +99,7 @@ class DatabaseAccess:
                     # use the insert template
                     statement = insert_template.format(chrom=c, pos=p, ab=str(allele_balance),
                                                        ac=str(allele_count), genotype=genotype, ma=first_alleles,
-                                                       alleles=alleles)
+                                                       alleles=alleles, samps=sample, ng=numerical_genotype)
                     curs.execute(statement)
                 else:
                     # use the update template
@@ -93,7 +109,8 @@ class DatabaseAccess:
                                                        ac=res[0][1] + ';' + str(allele_count),
                                                        genotype=genotype,
                                                        ma=res[0][2] + ';' + first_alleles,
-                                                       alleles=res[0][3] + ';' + alleles)
+                                                       alleles=res[0][3] + ';' + alleles,
+                                                       samps=res[0][4] + ';' + sample)
                     curs.execute(statement)
             # commit changes after each chromosome
             self.connection.commit()
@@ -126,8 +143,63 @@ class DatabaseAccess:
         std = np.std(allele_balances)
         return [mean, std]
 
+    def query_db(self, samples: list):
+        """
+        Give an list of samples names, calculate the difference between mean allele balances of the rest of the
+        population and the requested samples and calculate a p value of the allele balances of the samples vs rest of
+        the population at each site the samples are present at. Creates a file in the current working directory named
+        'query_results.tsv'.
+        :param samples: list of names of samples that should be compared to the results of the population in the db
+        :return: pandas DataFrame with the following columns: chromosome, position, genotype, numerical_genotype,
+                 population_size, p_value, avg_allele_balance_difference
+        """
+        output_dict = {'chromosome': [],
+                       'position': [],
+                       'genotype': [],
+                       'numerical_genotype': [],
+                       'population_size': [],
+                       'p_value': [],
+                       'avg_allele_balance_difference': []}
+        chromosomes = [str(x) for x in range(1, 24)]
+        chromosomes.append('x')
+        chromosomes.append('y')
 
-def collect_and_output_genotypes(input_file, output_file, db_path, coverage_threshold, geno_dict):
+        curs = self.connection.cursor()
+        for c in chromosomes:
+            # # remove this after development
+            # if c != '1':
+            #     return
+            get_template = """SELECT position, genotype, allele_balances, numerical_genotype, samples FROM chromosome_{chr} WHERE samples LIKE '%{sample}%' """
+            other_sample_template = "AND samples LIKE '%{sample}%'"
+            statement = get_template.format(sample=samples[0], chr=c)
+            for samp in samples[1:]:
+                statement += other_sample_template.format(sample=samp)
+            curs.execute(statement)
+            res = curs.fetchall()
+            # for each row in the db with those samples listed
+            for r in res:
+                all_samp_names = r[4].split(';')
+                all_samp_names = [x.replace('\n','') for x in all_samp_names]
+                all_abs = r[2].split(';')
+                all_abs = [float(x) for x in all_abs]
+                in_samples = [x for i, x in enumerate(all_abs) if all_samp_names[i] in samples]
+                # get those in the population
+                population = [x for i, x in enumerate(all_abs) if all_samp_names[i] not in samples]
+                p_val = stats.ttest_ind(in_samples,population).pvalue
+                diff = (sum(population)/len(population)) - (sum(in_samples)/len(in_samples))
+                output_dict['chromosome'].append(c)
+                output_dict['position'].append(r[0])
+                output_dict['genotype'].append(r[1])
+                output_dict['numerical_genotype'].append(r[2])
+                output_dict['population_size'].append(len(population))
+                output_dict['p_value'].append(p_val)
+                output_dict['avg_allele_balance_difference'].append(diff)
+        df = pd.DataFrame(output_dict)
+        df.to_csv('query_results.tsv', sep='\t')
+        return df
+
+
+def collect_and_output_genotypes(input_file, output_file, db_path, coverage_threshold, geno_dict, numerical_geno_dict):
     ab_info = {'chromosome': [],
                'position': [],
                'genotype': [],
@@ -138,6 +210,7 @@ def collect_and_output_genotypes(input_file, output_file, db_path, coverage_thre
                'first_allele': [],
                'reference_allele': [],
                'z_score': [],
+               'numerical_genotype': [],
                'strand_bias': []}
     da = DatabaseAccess(db_path)
     count = 0
@@ -169,6 +242,9 @@ def collect_and_output_genotypes(input_file, output_file, db_path, coverage_thre
             seq = re.sub('\\^.', '', seq)
 
             # what portion of reads come from the forward stand?
+            if len(seq) == 0:
+                log_file.write('Error line has no sequence length: ' + line)
+                continue
             strand_bias = sum(x == '.' or x.isupper() for x in seq) / len(seq)
 
             seq = seq.upper()
@@ -237,6 +313,12 @@ def collect_and_output_genotypes(input_file, output_file, db_path, coverage_thre
             ab_info['allele_counts'].append(','.join([str(x) for x in allele_counts]))
             ab_info['z_score'].append(z_score)
             ab_info['strand_bias'].append(strand_bias)
+            try:
+                ab_info['numerical_genotype'].append(numerical_geno_dict[str(row[0])][str(row[1])])
+            except KeyError:
+                log_file.write('Error: no numerical genotype found for chromosome ' + str(row[0]) + ' postition ' +
+                               str(row[1]) + '\n')
+                ab_info['numerical_genotype'].append('Error')
 
     df = pd.DataFrame(ab_info)
 
@@ -326,16 +408,12 @@ def get_numerical_genotype_dict_from_vcf(vcf: str) -> dict:
     return geno_dict
 
 
-def make_fingerprint_report(df, vcf, fingerprint):
+def make_fingerprint_report(df, fingerprint, ngd):
     """
     Give a dataframe witb allele balance information, a vcf and .bed file: creates an allele balance report for the
     sites listed in the .bed file :param df: DataFrame formatted like the output of collect_and_output_genotypes
     :param vcf: path to vcf.gz file :param fingerprint: path to .bed file :return: None
     """
-    df = pd.read_csv('output.tsv', sep='\t', skiprows=1)
-    vcf = '/Users/michael/TESTBAMs/sample.vcf.gz'
-    fingerprint = 'HighQualitySnps.bed'
-    ngd = get_numerical_genotype_dict_from_vcf(vcf)
 
     high_quality_report = {'chromosome': [], 'position': [], 'genotype': [], 'numerical_genotype': [],
                            'allele_balance': [], 'z_score': []}
@@ -363,40 +441,52 @@ def make_fingerprint_report(df, vcf, fingerprint):
             high_quality_report['numerical_genotype'].append('NOT FOUND')
             high_quality_report['allele_balance'].append('NOT FOUND')
             high_quality_report['z_score'].append('NOT FOUND')
-    pd.DataFrame(high_quality_report).to_csv('fingerprint.tsv', sep='\t')
+    df = pd.DataFrame(high_quality_report)
+    df.to_csv('fingerprint.tsv', sep='\t')
+    return df
 
 
-def run_sample(db_path, pileup_path, vcf_path, fingerprint=None):
+def analyze(db_path, pileup_path, vcf_path, sample, fingerprint=None):
     """
-       Required Files
-       1. sample.pileup
-       2. sample.vcf
-       3. Path to DB, as sys.argv[1]
-       Output
-       1. ab_report.txt
-       """
-
+    :param db_path: path to database
+    :param pileup_path: path to .pileup.gz file
+    :param vcf_path: path to .vcf.gz file
+    :param sample: name of the sample being analyzed
+    :param fingerprint: (optional) path to fingerprinting .bed file
+    :return:
+            1. (if no fingerprint file is specified) pandas DataFrame with allele balance information
+            2. (if fingerprint file is provided) 2 pandas DataFrames. One as previously described and one containing the
+               fingerprint profiles
+    """
     pileup_file = pileup_path
     vcf_file = vcf_path
     output_file = 'output.tsv'
 
     gd = get_genotype_dict_from_vcf(vcf_file)
-    df = collect_and_output_genotypes(pileup_file, output_file, db_path, 40, gd)
+    ngd = get_numerical_genotype_dict_from_vcf(vcf_file)
+    df = collect_and_output_genotypes(pileup_file, output_file, db_path, 40, gd, ngd)
 
     out_of_range_count = sum(df['z_score'] >= 3) + sum(df['z_score'] <= -3)
     with open(output_file, 'w') as file:
         file.write('# number of samples out of range:\t' + str(out_of_range_count) + '\n')
+        file.write('# sample name:\t' + sample + '\n')
     df.to_csv(output_file, mode='a', header=True, sep='\t')
 
     # if no finger printing .bed file is provided go ahead and return
     if fingerprint is None:
-        return
+        return df
     else:
-        make_fingerprint_report(df, vcf_file, fingerprint)
+        fp_df = make_fingerprint_report(df, fingerprint, ngd)
+        return df, fp_df
 
 
 def get_args():
     parser = argparse.ArgumentParser()
+
+    parser.add_argument("--name",
+                        dest="name",
+                        required=False,
+                        help="sample name to be used in output files required if using `--type analyze`")
 
     parser.add_argument("--db",
                         dest="db_path",
@@ -422,7 +512,8 @@ def get_args():
     parser.add_argument("--type",
                         dest="run_type",
                         required=True,
-                        help="function to be run: analyze sample `--type analyze` or update db `--type update`")
+                        help="function to be run: analyze sample `--type analyze`, update db `--type update` or "
+                             "query information from db `--type query`")
 
     parser.add_argument("--inputs",
                         dest="inputs",
@@ -437,12 +528,22 @@ def get_args():
                              "it will force the db to update it self with the given input files even if they do not "
                              "meet the threshold requirements")
 
+    parser.add_argument("--samples",
+                        dest="samples",
+                        required=False,
+                        help="comma separated list of sample names to be pull allele balance information from the "
+                             "database on. Only use if using `--type query`")
+
     args = parser.parse_args()
 
     return args
 
 
 def check_update(files):
+    """
+    :param files: list of files to check if they meet the requirements to update the db
+    :return: true or false (true if the db should be update with these files)
+    """
     files_over_thresh = 0
     for file in files:
         # the first line of each file has the number of sites out of range in each file
@@ -454,17 +555,29 @@ def check_update(files):
     return files_over_thresh == 0
 
 
+def update(db_path, files):
+    """
+    :param db_path: path to the database
+    :param files: list of files to update database with
+    """
+    da = DatabaseAccess(db_path)
+    for file in files:
+        print(file)
+        da.update_db_with_tsv(file)
+
+
+def query(db_path, samples):
+    """
+    :param db_path: path to the database
+    :param samples: list of samples to compare to rest of population in db
+    :return: pandas DataFrame
+    """
+    da = DatabaseAccess(db_path)
+    return da.query_db(samples)
+
+
 with open('allele_balance_log.txt', 'a') as log_file:
     if __name__ == "__main__":
-        """
-        Required Files
-        1. sample.pileup
-        2. sample.vcf
-        3. Path to DB, as sys.argv[1]
-        Output
-        1. ab_report.txt
-        2. allele_balance_log.txt
-        """
         args = vars(get_args())
         if args['run_type'] == 'update':
             da = DatabaseAccess(args['db_path'])
@@ -475,16 +588,24 @@ with open('allele_balance_log.txt', 'a') as log_file:
             files = args['inputs'].split(',')
             files = [x for x in files if x != '']
             if check_update(files) or args['force_update'] == 'true':
-                for file in files:
-                    da.update_db_with_tsv(file)
-                    log_file.write('Updated database with file:' + file + ' \n')
+                update(args['db_path'], files)
             else:
                 print('Not updating database, too many samples with an abnormal number of imbalanced alleles. Bad '
                       'batch suspected\n')
                 log_file.write('Not updating database, too many samples with an abnormal number of imbalanced '
                                'alleles. Bad batch suspected\n')
         elif args['run_type'] == 'analyze':
-            run_sample(args['db_path'], args['pileup'], args['vcf'], args['fingerprint'])
+            analyze(args['db_path'], args['pileup'], args['vcf'], args['name'], args['fingerprint'])
+        elif args['run_type'] == 'query':
+            if args['samples'] is None:
+                log_file.write('Error: `--samples` parameter is required if using `--type query`')
+                quit()
+            samps = args['samples'].split(',')
+            if len(samps) < 2:
+                log_file.write('Error: `--samples` must include at least 2 comma separated items when using `--type '
+                               'query`')
+                quit()
+            query(args['db_path'], samps)
         else:
             print('Invalid `--type`. To analyze a sample use `--type analyze` or to update the db `--type update`')
             log_file.write(
